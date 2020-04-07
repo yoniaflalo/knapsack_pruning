@@ -1,0 +1,10 @@
+# The version of the current hyperml_downloader.yaml
+version: 2
+
+assets:
+  oss:
+
+credentials:
+
+  oss:
+

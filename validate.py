@@ -11,16 +11,15 @@ import argparse
 import os
 import csv
 import glob
-import time
-import logging
-import torch
-import torch.nn as nn
 import torch.nn.parallel
 from collections import OrderedDict
 
 from timm.models import create_model, apply_test_time_pool, load_checkpoint, is_model, list_models
 from timm.data import Dataset, DatasetTar, create_loader, resolve_data_config
 from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging
+from external.hyperml import HypermlDownloader
+from external.oss_and_hyperML_manager import untar_dataset_files
+from external.utils_pruning import *
 
 torch.backends.cudnn.benchmark = True
 
@@ -39,7 +38,7 @@ parser.add_argument('--crop-pct', default=None, type=float,
                     metavar='N', help='Input image center crop pct')
 parser.add_argument('--mean', type=float, nargs='+', default=None, metavar='MEAN',
                     help='Override mean pixel value of dataset')
-parser.add_argument('--std', type=float,  nargs='+', default=None, metavar='STD',
+parser.add_argument('--std', type=float, nargs='+', default=None, metavar='STD',
                     help='Override std deviation of of dataset')
 parser.add_argument('--interpolation', default='', type=str, metavar='NAME',
                     help='Image resize interpolation type (overrides model)')
@@ -71,22 +70,32 @@ parser.add_argument('--torchscript', dest='torchscript', action='store_true',
                     help='convert model torchscript for inference')
 parser.add_argument('--results-file', default='', type=str, metavar='FILENAME',
                     help='Output csv file for validation results (summary)')
+# HyperMl and OSS args:
+
+# pruning parameters
 
 
 def validate(args):
     # might as well try to validate something
-    args.pretrained = args.pretrained or not args.checkpoint
+    args.pretrained = args.pretrained or (not args.checkpoint and not args.oss_checkpoint_path)
     args.prefetcher = not args.no_prefetcher
-
-    # create model
     model = create_model(
         args.model,
         num_classes=args.num_classes,
         in_chans=3,
         pretrained=args.pretrained)
-
+    data_config = resolve_data_config(vars(args), model=model)
     if args.checkpoint:
-        load_checkpoint(model, args.checkpoint, args.use_ema)
+        try:
+            load_checkpoint(model, args.checkpoint, args.use_ema)
+        except:
+            logging.info("Model does not match the checkpoint, attempting to adapt the model to the checkpoint")
+            try:
+                model = load_module_from_ckpt(model, args.checkpoint, args.use_ema,
+                                              input_size=data_config['input_size'][1])
+                logging.info("Model adapted to the checkpoint")
+            except Exception as e:
+                raise RuntimeError(e)
 
     param_count = sum([m.numel() for m in model.parameters()])
     logging.info('Model %s created, param count: %d' % (args.model, param_count))
@@ -130,11 +139,11 @@ def validate(args):
         fp16=args.fp16,
         tf_preprocessing=args.tf_preprocessing)
 
+
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
-
     model.eval()
     end = time.time()
     with torch.no_grad():
@@ -179,7 +188,7 @@ def validate(args):
         interpolation=data_config['interpolation'])
 
     logging.info(' * Prec@1 {:.3f} ({:.3f}) Prec@5 {:.3f} ({:.3f})'.format(
-       results['top1'], results['top1_err'], results['top5'], results['top5_err']))
+        results['top1'], results['top1_err'], results['top5'], results['top5_err']))
 
     return results
 

@@ -1,19 +1,3 @@
-#!/usr/bin/env python
-""" ImageNet Training Script
-
-This is intended to be a lean and easily modifiable ImageNet training script that reproduces ImageNet
-training results with some of the latest networks and training techniques. It favours canonical PyTorch
-and standard Python style over trying to be able to 'do it all.' That said, it offers quite a few speed
-and training result improvements over the usual PyTorch example scripts. Repurpose as you see fit.
-
-This script was started from an early version of the PyTorch ImageNet example
-(https://github.com/pytorch/examples/tree/master/imagenet)
-
-NVIDIA CUDA specific speedups adopted from NVIDIA Apex examples
-(https://github.com/NVIDIA/apex/tree/master/examples/imagenet)
-
-Hacked together by Ross Wightman (https://github.com/rwightman)
-"""
 import argparse
 import time
 import yaml
@@ -41,11 +25,13 @@ from external.distributed_manager import DistributedManager
 from external.hyperml import HypermlDownloader
 from external.oss_and_hyperML_manager import untar_dataset_files
 from external.oss_and_pruning_parser import *
-from external.utils_pruning import load_module_from_ckpt, build_co_train_model, compute_flops
+from external.utils_pruning import *
 import torch
 import torch.nn as nn
 import torchvision.utils
+from timm.utils import reduce_tensor as reduce_tensor
 import gc
+
 torch.backends.cudnn.benchmark = True
 
 # The first arg parser parses out only the --config argument, this argument is used to
@@ -60,14 +46,12 @@ parser.add_argument('data', metavar='DIR',
                     help='path to dataset')
 parser.add_argument('--model', default='gluon_resnet50_v1d', type=str, metavar='MODEL',
                     help='Name of model to train (default: "countception"')
-parser.add_argument('--model_IKD', default=None, type=str, metavar='MODEL',
-                    help='Name of model to train ')
 parser.add_argument('--pretrained', action='store_true', default=False,
                     help='Start with pretrained version of specified network (if avail)')
 parser.add_argument('--initial-checkpoint', default='', type=str, metavar='PATH',
                     help='Initialize model from this checkpoint (default: none)')
-parser.add_argument('--initial-checkpoint_IKD', default='', type=str, metavar='PATH',
-                    help='Initialize model from this checkpoint (default: none)')
+parser.add_argument('--initial-checkpoint-pruned', default='', type=str, metavar='PATH',
+                    help='Initialize model from this checkpoint  form the pruned model (default: none)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='Resume full model and optimizer state from checkpoint (default: none)')
 parser.add_argument('--no-resume-opt', action='store_true', default=False,
@@ -157,7 +141,7 @@ parser.add_argument('--mixup', type=float, default=0.0,
                     help='mixup alpha, mixup enabled if > 0. (default: 0.)')
 parser.add_argument('--mixup-off-epoch', default=0, type=int, metavar='N',
                     help='turn off mixup after this epoch, disabled if 0 (default: 0)')
-parser.add_argument('--smoothing', type=float, default=0.1,
+parser.add_argument('--smoothing', type=float, default=0,
                     help='label smoothing (default: 0.1)')
 parser.add_argument('--train-interpolation', type=str, default='random',
                     help='Training interpolation (random, bilinear, bicubic default: "random")')
@@ -207,6 +191,8 @@ parser.add_argument('--eval-metric', default='prec1', type=str, metavar='EVAL_ME
 parser.add_argument('--tta', type=int, default=0, metavar='N',
                     help='Test/inference time augmentation (oversampling) factor. 0=None (default: 0)')
 parser.add_argument("--local_rank", default=0, type=int)
+parser.add_argument('--use_eca', action='store_true', default=False,
+                    help='Use eca bn for efficientNet')
 
 # HyperMl and OSS args:
 add_prune_to_parser(parser)
@@ -262,88 +248,36 @@ def main():
 
     torch.manual_seed(args.seed + args.rank)
 
-    try:
-        model = create_model(
-            args.model,
-            pretrained=args.pretrained,
-            num_classes=args.num_classes,
-            drop_rate=args.drop,
-            drop_connect_rate=args.drop_connect,
-            drop_path_rate=args.drop_path,
-            drop_block_rate=args.drop_block,
-            global_pool=args.gp,
-            bn_tf=args.bn_tf,
-            bn_momentum=args.bn_momentum,
-            bn_eps=args.bn_eps,
-            checkpoint_path=args.initial_checkpoint)
-    except:
-        model = create_model(
-            args.model,
-            pretrained=args.pretrained,
-            num_classes=args.num_classes,
-            drop_rate=args.drop,
-            drop_connect_rate=args.drop_connect,
-            drop_path_rate=args.drop_path,
-            drop_block_rate=args.drop_block,
-            global_pool=args.gp,
-            bn_tf=args.bn_tf,
-            bn_momentum=args.bn_momentum,
-            bn_eps=args.bn_eps)
-        data_config = resolve_data_config(vars(args), model=model, verbose=args.local_rank == 0)
-        model = load_module_from_ckpt(model, args.initial_checkpoint, input_size=data_config['input_size'][1])
+    model = create_model(
+        args.model,
+        pretrained=args.pretrained,
+        num_classes=args.num_classes,
+        drop_rate=args.drop,
+        drop_connect_rate=args.drop_connect,
+        drop_path_rate=args.drop_path,
+        drop_block_rate=args.drop_block,
+        global_pool=args.gp,
+        bn_tf=args.bn_tf,
+        bn_momentum=args.bn_momentum,
+        bn_eps=args.bn_eps,
+        checkpoint_path=args.initial_checkpoint)
+
+    if args.initial_checkpoint_pruned:
+        try:
+            data_config = resolve_data_config(vars(args), model=model, verbose=args.local_rank == 0)
+            model2 = load_module_from_ckpt(model, args.initial_checkpoint_pruned,
+                                           input_size=data_config['input_size'][1])
+            logging.info("New pruned model adapted from the checkpoint")
+        except Exception as e:
+            raise RuntimeError(e)
+    else:
+        model2 = model
+
     if args.local_rank == 0:
         logging.info('Model %s created, param count: %d' %
-                     (args.model, sum([m.numel() for m in model.parameters()])))
+                     (args.model, sum([m.numel() for m in model2.parameters()])))
+
     data_config = resolve_data_config(vars(args), model=model, verbose=args.local_rank == 0)
-
-    flops = compute_flops(model, data_config['input_size'])
-
-    if args.local_rank == 0:
-        logging.info('Model %s flops: %f GFlops' %
-                     (args.model, flops / 1e9))
-
-    if args.model_IKD is not None:
-        try:
-            model_IKD = create_model(
-                args.model_IKD,
-                pretrained=args.pretrained,
-                num_classes=args.num_classes,
-                drop_rate=args.drop,
-                drop_connect_rate=args.drop_connect,
-                drop_path_rate=args.drop_path,
-                drop_block_rate=args.drop_block,
-                global_pool=args.gp,
-                bn_tf=args.bn_tf,
-                bn_momentum=args.bn_momentum,
-                bn_eps=args.bn_eps,
-                checkpoint_path=args.initial_checkpoint_IKD)
-        except:
-            model_IKD = create_model(
-                args.model_IKD,
-                pretrained=args.pretrained,
-                num_classes=args.num_classes,
-                drop_rate=args.drop,
-                drop_connect_rate=args.drop_connect,
-                drop_path_rate=args.drop_path,
-                drop_block_rate=args.drop_block,
-                global_pool=args.gp,
-                bn_tf=args.bn_tf,
-                bn_momentum=args.bn_momentum,
-                bn_eps=args.bn_eps)
-            data_config2 = resolve_data_config(vars(args), model=model_IKD, verbose=args.local_rank == 0)
-            model_IKD = load_module_from_ckpt(model_IKD, args.initial_checkpoint_IKD,
-                                              input_size=data_config2['input_size'][1])
-        model_IKD.eval()
-        if args.local_rank == 0:
-            logging.info('Model IKD to train %s created, param count: %d' %
-                         (args.model_IKD, sum([m.numel() for m in model.parameters()])))
-
-        flops = compute_flops(model_IKD, data_config['input_size'])
-
-        if args.local_rank == 0:
-            logging.info('Model IKD %s flops: %f GFlops' %
-                         (args.model_IKD, flops / 1e9))
-
 
     num_aug_splits = 0
     if args.aug_splits > 0:
@@ -355,101 +289,16 @@ def main():
         model = convert_splitbn_model(model, max(num_aug_splits, 2))
 
     if args.num_gpu > 1:
-        if args.amp:
-            logging.warning(
-                'AMP does not work well with nn.DataParallel, disabling. Use distributed mode for multi-GPU AMP.')
-            args.amp = False
-        model = nn.DataParallel(model, device_ids=list(range(args.num_gpu))).cuda()
-        if args.model_IKD is not None:
-            model_IKD = nn.DataParallel(model_IKD, device_ids=list(range(args.num_gpu))).cuda()
-
+        model2 = nn.DataParallel(model2, device_ids=list(range(args.num_gpu))).cuda()
     else:
-        model = model.cuda()
-        if args.model_IKD is not None:
-            model_IKD = model_IKD.cuda()
-
-    if args.model_IKD is not None:
-        model_new = build_co_train_model(model_IKD, model, gamma=args.gamma_knowledge)
-        del model_IKD
-        del model
-        gc.collect()
-        model = model_new
-        model = model.cuda()
-        torch.cuda.empty_cache()
-
-    optimizer = create_optimizer(args, model)
+        model2.cuda()
 
     use_amp = False
-    if has_apex and args.amp:
-        model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
-        use_amp = True
-    if args.local_rank == 0:
-        logging.info('NVIDIA APEX {}. AMP {}.'.format(
-            'installed' if has_apex else 'not installed', 'on' if use_amp else 'off'))
-
-    # optionally resume from a checkpoint
-    resume_state = {}
-    resume_epoch = None
-    if args.resume:
-        resume_state, resume_epoch = resume_checkpoint(model, args.resume)
-    if resume_state and not args.no_resume_opt:
-        if 'optimizer' in resume_state:
-            if args.local_rank == 0:
-                logging.info('Restoring Optimizer state from checkpoint')
-            optimizer.load_state_dict(resume_state['optimizer'])
-        if use_amp and 'amp' in resume_state and 'load_state_dict' in amp.__dict__:
-            if args.local_rank == 0:
-                logging.info('Restoring NVIDIA AMP state from checkpoint')
-            amp.load_state_dict(resume_state['amp'])
-    del resume_state
-
-    model_ema = None
-    if args.model_ema:
-        # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
-        model_ema = ModelEma(
-            model,
-            decay=args.model_ema_decay,
-            device='cpu' if args.model_ema_force_cpu else '',
-            resume=args.resume)
 
     if args.distributed:
-        if args.sync_bn:
-            assert not args.split_bn
-            try:
-                if has_apex:
-                    model = convert_syncbn_model(model)
-                else:
-                    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-                if args.local_rank == 0:
-                    logging.info(
-                        'Converted model to use Synchronized BatchNorm. WARNING: You may have issues if using '
-                        'zero initialized BN layers (enabled by default for ResNets) while sync-bn enabled.')
-            except Exception as e:
-                logging.error('Failed to enable Synchronized BatchNorm. Install Apex or Torch >= 1.1')
-        if has_apex:
-            model = DDP(model, delay_allreduce=True)
-            # if args.model_IKD is not None:
-            #     model_IKD = DDP(model_IKD, delay_allreduce=True)
-        else:
-            if args.local_rank == 0:
-                logging.info("Using torch DistributedDataParallel. Install NVIDIA Apex for Apex DDP.")
-            model = DDP(model, device_ids=[args.local_rank])  # can use device str in Torch >= 1.1
-            # if args.model_IKD is not None:
-            #     model_IKD = DDP(model_IKD, device_ids=[args.local_rank])
+        model2 = nn.parallel.distributed.DistributedDataParallel(model2, device_ids=[
+            args.local_rank])  # can use device str in Torch >= 1.1
         # NOTE: EMA model does not need to be wrapped by DDP
-
-    lr_scheduler, num_epochs = create_scheduler(args, optimizer)
-    start_epoch = 0
-    if args.start_epoch is not None:
-        # a specified start_epoch will always override the resume epoch
-        start_epoch = args.start_epoch
-    elif resume_epoch is not None:
-        start_epoch = resume_epoch
-    if lr_scheduler is not None and start_epoch > 0:
-        lr_scheduler.step(start_epoch)
-
-    if args.local_rank == 0:
-        logging.info('Scheduled epochs: {}'.format(num_epochs))
 
     train_dir = os.path.join(args.data, 'train')
     if not os.path.exists(train_dir):
@@ -459,11 +308,7 @@ def main():
 
     collate_fn = None
     if args.prefetcher and args.mixup > 0:
-        assert not num_aug_splits  # collate conflict (need to support deinterleaving in collate mixup)
         collate_fn = FastCollateMixup(args.mixup, args.smoothing, args.num_classes)
-
-    if num_aug_splits > 1:
-        dataset_train = AugMixDataset(dataset_train, num_splits=num_aug_splits)
 
     loader_train = create_loader(
         dataset_train,
@@ -484,7 +329,7 @@ def main():
         num_workers=args.workers,
         distributed=args.distributed,
         collate_fn=collate_fn,
-        pin_memory=args.pin_mem
+        pin_memory=args.pin_mem,
     )
 
     eval_dir = os.path.join(args.data, 'val')
@@ -495,7 +340,21 @@ def main():
             if not os.path.isdir(eval_dir):
                 logging.error('Validation folder does not exist at: {}'.format(eval_dir))
                 exit(1)
+
+    test_dir = os.path.join(args.data, 'test')
+    if not os.path.isdir(test_dir):
+        test_dir = os.path.join(args.data, 'validation')
+        if not os.path.isdir(test_dir):
+            test_dir = os.path.join(args.data, 'val')
+            if not os.path.isdir(test_dir):
+                logging.error('Test folder does not exist at: {}'.format(test_dir))
+                exit(1)
+
     dataset_eval = Dataset(eval_dir)
+    if args.prune_test:
+        dataset_test = Dataset(test_dir)
+    else:
+        dataset_test = Dataset(train_dir)
     loader_eval = create_loader(
         dataset_eval,
         input_size=data_config['input_size'],
@@ -508,8 +367,120 @@ def main():
         num_workers=args.workers,
         distributed=args.distributed,
         crop_pct=data_config['crop_pct'],
-        pin_memory=args.pin_mem
+        pin_memory=args.pin_mem,
     )
+    len_loader = int(len(loader_eval) * (4 * args.batch_size) / args.batch_size_prune)
+    if args.prune_test:
+        len_loader = None
+    if args.prune:
+        loader_p = create_loader(
+            dataset_test,
+            input_size=data_config['input_size'],
+            batch_size=args.batch_size_prune,
+            is_training=False,
+            use_prefetcher=args.prefetcher,
+            interpolation=data_config['interpolation'],
+            mean=data_config['mean'],
+            std=data_config['std'],
+            num_workers=args.workers,
+            distributed=args.distributed,
+            crop_pct=data_config['crop_pct'],
+            pin_memory=args.pin_mem,
+        )
+        if 'resnet' in model2.__class__.__name__.lower() or (
+            hasattr(model2, 'module') and 'resnet' in model2.module.__class__.__name__.lower()):
+            list_channel_to_prune = compute_num_channels_per_layer_taylor(model2, data_config['input_size'], loader_p,
+                                                                          pruning_ratio=args.pruning_ratio,
+                                                                          taylor_file=args.taylor_file,
+                                                                          local_rank=args.local_rank,
+                                                                          len_data_loader=len_loader,
+                                                                          prune_skip=args.prune_skip,
+                                                                          taylor_abs=args.taylor_abs,
+                                                                          prune_conv1=args.prune_conv1,
+                                                                          use_time=args.use_time,
+                                                                          distributed=args.distributed)
+            new_net = redesign_module_resnet(model2, list_channel_to_prune, use_amp=use_amp,
+                                             distributed=args.distributed,
+                                             local_rank=args.local_rank, input_size=data_config['input_size'][1])
+        else:
+            list_channel_to_prune = compute_num_channels_per_layer_taylor(model2, data_config['input_size'],
+                                                                          loader_p,
+                                                                          pruning_ratio=args.pruning_ratio,
+                                                                          taylor_file=args.taylor_file,
+                                                                          local_rank=args.local_rank,
+                                                                          len_data_loader=len_loader,
+                                                                          prune_pwl=not args.no_pwl,
+                                                                          taylor_abs=args.taylor_abs,
+                                                                          use_se=not args.use_eca,
+                                                                          use_time=args.use_time,
+                                                                          distributed=args.distributed)
+            new_net = redesign_module_efnet(model2, list_channel_to_prune, use_amp=use_amp,
+                                            distributed=args.distributed,
+                                            local_rank=args.local_rank, input_size=data_config['input_size'][1],
+                                            use_se=not args.use_eca)
+
+        new_net.train()
+        model.train()
+        if isinstance(model, nn.DataParallel) or isinstance(model, DDP):
+            model = model.module
+        else:
+            model = model.cuda()
+
+        co_mod = build_co_train_model(model, new_net.module.cpu() if hasattr(new_net, 'module') else new_net,
+                                      gamma=args.gamma_knowledge, only_last=args.only_last,
+                                      progressive_IKD_factor=args.progressive_IKD_factor)
+        optimizer = create_optimizer(args, co_mod)
+
+        del model
+        del new_net
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        if args.num_gpu > 1:
+            if args.amp:
+                logging.warning(
+                    'AMP does not work well with nn.DataParallel, disabling. Use distributed mode for multi-GPU AMP.')
+                args.amp = False
+            co_mod = nn.DataParallel(co_mod, device_ids=list(range(args.num_gpu))).cuda()
+        else:
+            co_mod = co_mod.cuda()
+
+        use_amp = False
+        if has_apex and args.amp:
+            co_mod, optimizer = amp.initialize(co_mod, optimizer, opt_level='O1')
+            use_amp = True
+        if args.local_rank == 0:
+            logging.info('NVIDIA APEX {}. AMP {}.'.format(
+                'installed' if has_apex else 'not installed', 'on' if use_amp else 'off'))
+
+        if args.distributed:
+            if args.sync_bn:
+                try:
+                    if has_apex and use_amp:
+                        co_mod = convert_syncbn_model(co_mod)
+                    else:
+                        co_mod = torch.nn.SyncBatchNorm.convert_sync_batchnorm(co_mod)
+                    if args.local_rank == 0:
+                        logging.info('Converted model to use Synchronized BatchNorm.')
+                except Exception as e:
+                    logging.error('Failed to enable Synchronized BatchNorm. Install Apex or Torch >= 1.1')
+            if has_apex and use_amp:
+                co_mod = DDP(co_mod, delay_allreduce=False)
+            else:
+                if args.local_rank == 0 and use_amp:
+                    logging.info("Using torch DistributedDataParallel. Install NVIDIA Apex for Apex DDP.")
+                co_mod = nn.parallel.distributed.DistributedDataParallel(co_mod, device_ids=[
+                    args.local_rank])  # can use device str in Torch >= 1.1
+            # NOTE: EMA model does not need to be wrapped by DDP
+            co_mod.train()
+
+        lr_scheduler, num_epochs = create_scheduler(args, optimizer)
+        start_epoch = 0
+        if args.start_epoch is not None:
+            # a specified start_epoch will always override the resume epoch
+            start_epoch = args.start_epoch
+        if lr_scheduler is not None and start_epoch > 0:
+            lr_scheduler.step(start_epoch)
 
     if args.jsd:
         assert num_aug_splits > 1  # JSD only valid with aug splits set
@@ -545,30 +516,24 @@ def main():
             f.write(args_text)
 
     try:
+        if args.local_rank == 0:
+            logging.info(f'First validation')
+        co_mod.eval()
+        eval_metrics = validate(co_mod, loader_eval, validate_loss_fn, args)
+        if args.local_rank == 0:
+            logging.info(f'Prec@top1 : {eval_metrics["prec1"]}')
+        co_mod.train()
         for epoch in range(start_epoch, num_epochs):
             torch.cuda.empty_cache()
             if args.distributed:
                 loader_train.sampler.set_epoch(epoch)
 
             train_metrics = train_epoch(
-                epoch, model, loader_train, optimizer, train_loss_fn, args,
+                epoch, co_mod, loader_train, optimizer, train_loss_fn, args,
                 lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
-                use_amp=use_amp, model_ema=model_ema)
+                use_amp=use_amp, model_ema=None)
             torch.cuda.empty_cache()
-            if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
-                if args.local_rank == 0:
-                    logging.info("Distributing BatchNorm running means and vars")
-                distribute_bn(model, args.world_size, args.dist_bn == 'reduce')
-
-            eval_metrics = validate(model, loader_eval, validate_loss_fn, args)
-
-            if model_ema is not None and not args.model_ema_force_cpu:
-                if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
-                    distribute_bn(model_ema, args.world_size, args.dist_bn == 'reduce')
-
-                ema_eval_metrics = validate(
-                    model_ema.ema, loader_eval, validate_loss_fn, args, log_suffix=' (EMA)')
-                eval_metrics = ema_eval_metrics
+            eval_metrics = validate(co_mod, loader_eval, validate_loss_fn, args)
 
             if lr_scheduler is not None:
                 # step LR for next epoch
@@ -582,8 +547,8 @@ def main():
                 # save proper checkpoint with eval metric
                 save_metric = eval_metrics[eval_metric]
                 best_metric, best_epoch = saver.save_checkpoint(
-                    model, optimizer, args,
-                    epoch=epoch, model_ema=model_ema, metric=save_metric, use_amp=use_amp)
+                    co_mod, optimizer, args,
+                    epoch=epoch, model_ema=None, metric=save_metric, use_amp=use_amp)
 
     except KeyboardInterrupt:
         pass
@@ -618,13 +583,9 @@ def train_epoch(
                     alpha=args.mixup, num_classes=args.num_classes, smoothing=args.smoothing,
                     disable=args.mixup_off_epoch and epoch >= args.mixup_off_epoch)
 
-        if args.model_IKD is not None:
-            output1, output2 = model(input)
+        output1, output2 = model(input)
 
-            loss = loss_fn(output1, target) + output2
-        else:
-            output = model(input)
-            loss = loss_fn(output, target)
+        loss = loss_fn(output1, target) + output2
         if not args.distributed:
             losses_m.update(loss.item(), input.size(0))
 

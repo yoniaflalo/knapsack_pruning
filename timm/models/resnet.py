@@ -9,12 +9,12 @@ import math
 
 import torch.nn as nn
 import torch.nn.functional as F
-
+import torch
 from .registry import register_model
 from .helpers import load_pretrained
 from .layers import SelectAdaptivePool2d, DropBlock2d, DropPath, AvgPool2dSame, create_attn
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-
+from external.DCT import DCTImage
 
 __all__ = ['ResNet', 'BasicBlock', 'Bottleneck']  # model_registry will add each entrypoint fn to this
 
@@ -46,6 +46,9 @@ default_cfgs = {
     'resnet50d': _cfg(
         url='',
         interpolation='bicubic'),
+    'dctseresnet50d': _cfg(
+        url='',
+        interpolation='bicubic', input_size=(3, 448, 448), crop_pct=0.934),
     'resnet101': _cfg(url='https://download.pytorch.org/models/resnet101-5d3b4d8f.pth'),
     'resnet152': _cfg(url='https://download.pytorch.org/models/resnet152-b121ed2d.pth'),
     'tv_resnet34': _cfg(url='https://download.pytorch.org/models/resnet34-333f7ec4.pth'),
@@ -66,9 +69,9 @@ default_cfgs = {
     'ig_resnext101_32x16d': _cfg(url='https://download.pytorch.org/models/ig_resnext101_32x16-c6f796b0.pth'),
     'ig_resnext101_32x32d': _cfg(url='https://download.pytorch.org/models/ig_resnext101_32x32-e4b90b00.pth'),
     'ig_resnext101_32x48d': _cfg(url='https://download.pytorch.org/models/ig_resnext101_32x48-3e41cc8a.pth'),
-    'ssl_resnet18':  _cfg(
+    'ssl_resnet18': _cfg(
         url='https://dl.fbaipublicfiles.com/semiweaksupervision/model_files/semi_supervised_resnet18-d92f0530.pth'),
-    'ssl_resnet50':  _cfg(
+    'ssl_resnet50': _cfg(
         url='https://dl.fbaipublicfiles.com/semiweaksupervision/model_files/semi_supervised_resnet50-08389792.pth'),
     'ssl_resnext50_32x4d': _cfg(
         url='https://dl.fbaipublicfiles.com/semiweaksupervision/model_files/semi_supervised_resnext50_32x4-ddb3e555.pth'),
@@ -117,7 +120,7 @@ class BasicBlock(nn.Module):
 
     def __init__(self, inplanes, planes, stride=1, downsample=None, cardinality=1, base_width=64,
                  reduce_first=1, dilation=1, first_dilation=None, act_layer=nn.ReLU, norm_layer=nn.BatchNorm2d,
-                 attn_layer=None, drop_block=None, drop_path=None):
+                 attn_layer=None, drop_block=None, drop_path=None, aa=False):
         super(BasicBlock, self).__init__()
 
         assert cardinality == 1, 'BasicBlock only supports cardinality of 1'
@@ -175,13 +178,37 @@ class BasicBlock(nn.Module):
         return x
 
 
+class Downsample_AA(nn.Module):
+    def __init__(self, filt_size=3, stride=2, channels=None):
+        super(Downsample_AA, self).__init__()
+        self.filt_size = filt_size
+        self.stride = stride
+        self.channels = channels
+        assert self.filt_size == 3
+        a = torch.tensor([1., 2., 1.])
+
+        filt = (a[:, None] * a[None, :]).clone().detach()
+        filt = filt / torch.sum(filt)
+        self.filt = filt[None, None, :, :].repeat((self.channels, 1, 1, 1))
+        # self.register_buffer('filt', filt[None, None, :, :].repeat((self.channels, 1, 1, 1)))
+
+    def forward(self, input):
+        input_pad = F.pad(input, (1, 1, 1, 1), 'reflect')
+        if input.device != self.filt.device:
+            self.filt = self.filt.to(device=input.device)
+        if input.type() != self.filt.type():
+            self.filt = self.filt.type(input.type())
+
+        return F.conv2d(input_pad, self.filt, stride=self.stride, padding=0, groups=input.shape[1])
+
+
 class Bottleneck(nn.Module):
     __constants__ = ['se', 'downsample']  # for pre 1.4 torchscript compat
     expansion = 4
 
     def __init__(self, inplanes, planes, stride=1, downsample=None, cardinality=1, base_width=64,
                  reduce_first=1, dilation=1, first_dilation=None, act_layer=nn.ReLU, norm_layer=nn.BatchNorm2d,
-                 attn_layer=None, drop_block=None, drop_path=None):
+                 attn_layer=None, drop_block=None, drop_path=None, aa=False):
         super(Bottleneck, self).__init__()
 
         width = int(math.floor(planes * (base_width / 64)) * cardinality)
@@ -192,9 +219,16 @@ class Bottleneck(nn.Module):
         self.conv1 = nn.Conv2d(inplanes, first_planes, kernel_size=1, bias=False)
         self.bn1 = norm_layer(first_planes)
         self.act1 = act_layer(inplace=True)
-        self.conv2 = nn.Conv2d(
-            first_planes, width, kernel_size=3, stride=stride,
-            padding=first_dilation, dilation=first_dilation, groups=cardinality, bias=False)
+        if aa and stride == 2:
+            self.conv2 = nn.Sequential(nn.Conv2d(
+                first_planes, width, kernel_size=3, stride=1,
+                padding=first_dilation, dilation=first_dilation, groups=cardinality, bias=False),
+                Downsample_AA(channels=width, filt_size=3, stride=2))
+        else:
+            self.conv2 = nn.Conv2d(
+                first_planes, width, kernel_size=3, stride=stride,
+                padding=first_dilation, dilation=first_dilation, groups=cardinality, bias=False)
+
         self.bn2 = norm_layer(width)
         self.act2 = act_layer(inplace=True)
         self.conv3 = nn.Conv2d(width, outplanes, kernel_size=1, bias=False)
@@ -247,7 +281,7 @@ class Bottleneck(nn.Module):
 
 
 def downsample_conv(
-        in_channels, out_channels, kernel_size, stride=1, dilation=1, first_dilation=None, norm_layer=None):
+    in_channels, out_channels, kernel_size, stride=1, dilation=1, first_dilation=None, norm_layer=None):
     norm_layer = norm_layer or nn.BatchNorm2d
     kernel_size = 1 if stride == 1 and dilation == 1 else kernel_size
     first_dilation = (first_dilation or dilation) if kernel_size > 1 else 1
@@ -261,7 +295,7 @@ def downsample_conv(
 
 
 def downsample_avg(
-        in_channels, out_channels, kernel_size, stride=1, dilation=1, first_dilation=None, norm_layer=None):
+    in_channels, out_channels, kernel_size, stride=1, dilation=1, first_dilation=None, norm_layer=None):
     norm_layer = norm_layer or nn.BatchNorm2d
     avg_stride = stride if dilation == 1 else 1
     if stride == 1 and dilation == 1:
@@ -346,11 +380,13 @@ class ResNet(nn.Module):
     global_pool : str, default 'avg'
         Global pooling type. One of 'avg', 'max', 'avgmax', 'catavgmax'
     """
+
     def __init__(self, block, layers, num_classes=1000, in_chans=3,
                  cardinality=1, base_width=64, stem_width=64, stem_type='',
                  block_reduce_first=1, down_kernel_size=1, avg_down=False, output_stride=32,
                  act_layer=nn.ReLU, norm_layer=nn.BatchNorm2d, drop_rate=0.0, drop_path_rate=0.,
-                 drop_block_rate=0., global_pool='avg', zero_init_last_bn=True, block_args=None):
+                 drop_block_rate=0., global_pool='avg', zero_init_last_bn=True, block_args=None, use_DCT=False,
+                 aa=False, use_basic=False):
         block_args = block_args or dict()
         self.num_classes = num_classes
         deep_stem = 'deep' in stem_type
@@ -359,27 +395,49 @@ class ResNet(nn.Module):
         self.base_width = base_width
         self.drop_rate = drop_rate
         self.expansion = block.expansion
+        self.use_DCT = use_DCT
+        self.aa = aa
         super(ResNet, self).__init__()
 
         # Stem
-        if deep_stem:
-            stem_chs_1 = stem_chs_2 = stem_width
-            if 'tiered' in stem_type:
-                stem_chs_1 = 3 * (stem_width // 4)
-                stem_chs_2 = stem_width if 'narrow' in stem_type else 6 * (stem_width // 4)
-            self.conv1 = nn.Sequential(*[
-                nn.Conv2d(in_chans, stem_chs_1, 3, stride=2, padding=1, bias=False),
-                norm_layer(stem_chs_1),
-                act_layer(inplace=True),
-                nn.Conv2d(stem_chs_1, stem_chs_2, 3, stride=1, padding=1, bias=False),
-                norm_layer(stem_chs_2),
-                act_layer(inplace=True),
-                nn.Conv2d(stem_chs_2, self.inplanes, 3, stride=1, padding=1, bias=False)])
+        if self.use_DCT:
+            in_chans = 192
+            self.conv1 = nn.Sequential(
+                *[DCTImage(reshape=True),
+                  nn.Conv2d(in_chans, self.inplanes, kernel_size=1, stride=1, padding=0, bias=False)])
         else:
-            self.conv1 = nn.Conv2d(in_chans, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False)
+            if deep_stem:
+                stem_chs_1 = stem_chs_2 = stem_width
+                if 'tiered' in stem_type:
+                    stem_chs_1 = 3 * (stem_width // 4)
+                    stem_chs_2 = stem_width if 'narrow' in stem_type else 6 * (stem_width // 4)
+                if self.aa:
+                    self.conv1 = nn.Sequential(*[
+                        nn.Conv2d(in_chans, stem_chs_1, 3, stride=1, padding=1, bias=False),
+                        Downsample_AA(channels=stem_chs_1, filt_size=3, stride=2),
+                        norm_layer(stem_chs_1),
+                        act_layer(inplace=True),
+                        nn.Conv2d(stem_chs_1, stem_chs_2, 3, stride=1, padding=1, bias=False),
+                        norm_layer(stem_chs_2),
+                        act_layer(inplace=True),
+                        nn.Conv2d(stem_chs_2, self.inplanes, 3, stride=1, padding=1, bias=False)])
+                else:
+                    self.conv1 = nn.Sequential(*[
+                        nn.Conv2d(in_chans, stem_chs_1, 3, stride=2, padding=1, bias=False),
+                        norm_layer(stem_chs_1),
+                        act_layer(inplace=True),
+                        nn.Conv2d(stem_chs_1, stem_chs_2, 3, stride=1, padding=1, bias=False),
+                        norm_layer(stem_chs_2),
+                        act_layer(inplace=True),
+                        nn.Conv2d(stem_chs_2, self.inplanes, 3, stride=1, padding=1, bias=False)])
+            else:
+                self.conv1 = nn.Conv2d(in_chans, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1 = norm_layer(self.inplanes)
         self.act1 = act_layer(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        if self.use_DCT:
+            self.maxpool = nn.Identity()
+        else:
+            self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
         # Feature Blocks
         dp = DropPath(drop_path_rate) if drop_path_rate else None
@@ -397,11 +455,17 @@ class ResNet(nn.Module):
         layer_args = list(zip(channels, layers, strides, dilations))
         layer_kwargs = dict(
             reduce_first=block_reduce_first, act_layer=act_layer, norm_layer=norm_layer,
-            avg_down=avg_down, down_kernel_size=down_kernel_size, drop_path=dp, **block_args)
-        self.layer1 = self._make_layer(block, *layer_args[0], **layer_kwargs)
-        self.layer2 = self._make_layer(block, *layer_args[1], **layer_kwargs)
-        self.layer3 = self._make_layer(block, drop_block=db_3, *layer_args[2], **layer_kwargs)
-        self.layer4 = self._make_layer(block, drop_block=db_4, *layer_args[3], **layer_kwargs)
+            avg_down=avg_down, down_kernel_size=down_kernel_size, drop_path=dp, aa=aa, **block_args)
+        if use_basic:
+            self.layer1 = self._make_layer(BasicBlock, *layer_args[0], **layer_kwargs)
+            self.layer2 = self._make_layer(BasicBlock, *layer_args[1], **layer_kwargs)
+            self.layer3 = self._make_layer(block, drop_block=db_3, *layer_args[2], **layer_kwargs)
+            self.layer4 = self._make_layer(block, drop_block=db_4, *layer_args[3], **layer_kwargs)
+        else:
+            self.layer1 = self._make_layer(block, *layer_args[0], **layer_kwargs)
+            self.layer2 = self._make_layer(block, *layer_args[1], **layer_kwargs)
+            self.layer3 = self._make_layer(block, drop_block=db_3, *layer_args[2], **layer_kwargs)
+            self.layer4 = self._make_layer(block, drop_block=db_4, *layer_args[3], **layer_kwargs)
 
         # Head (Pooling and Classifier)
         self.global_pool = SelectAdaptivePool2d(pool_type=global_pool)
@@ -420,7 +484,7 @@ class ResNet(nn.Module):
                     m.zero_init_last_bn()
 
     def _make_layer(self, block, planes, blocks, stride=1, dilation=1, reduce_first=1,
-                    avg_down=False, down_kernel_size=1, **kwargs):
+                    avg_down=False, down_kernel_size=1, aa=False, **kwargs):
         downsample = None
         first_dilation = 1 if dilation in (1, 2) else 2
         if stride != 1 or self.inplanes != planes * block.expansion:
@@ -431,7 +495,7 @@ class ResNet(nn.Module):
 
         block_kwargs = dict(
             cardinality=self.cardinality, base_width=self.base_width, reduce_first=reduce_first,
-            dilation=dilation, **kwargs)
+            dilation=dilation, aa=aa, **kwargs)
         layers = [block(self.inplanes, planes, stride, downsample, first_dilation=first_dilation, **block_kwargs)]
         self.inplanes = planes * block.expansion
         layers += [block(self.inplanes, planes, **block_kwargs) for _ in range(1, blocks)]
@@ -466,6 +530,118 @@ class ResNet(nn.Module):
             x = F.dropout(x, p=float(self.drop_rate), training=self.training)
         x = self.fc(x)
         return x
+
+
+def _weights_init(m):
+    classname = m.__class__.__name__
+    if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
+        nn.init.kaiming_normal_(m.weight)
+
+
+class LambdaLayer_Cifar(nn.Module):
+    def __init__(self, lambd):
+        super(LambdaLayer_Cifar, self).__init__()
+        self.lambd = lambd
+
+    def forward(self, x):
+        return self.lambd(x)
+
+
+class BasicBlock_Cifar(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1, option='A'):
+        super(BasicBlock_Cifar, self).__init__()
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            if option == 'A':
+                """
+                For CIFAR10 ResNet paper uses option A.
+                """
+                self.shortcut = LambdaLayer_Cifar(lambda x:
+                                                  F.pad(x[:, :, ::2, ::2], (0, 0, 0, 0, planes // 4, planes // 4),
+                                                        "constant", 0))
+            elif option == 'B':
+                self.shortcut = nn.Sequential(
+                    nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
+                    nn.BatchNorm2d(self.expansion * planes)
+                )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class ResNet_Cifar(nn.Module):
+    def __init__(self, block, num_blocks, num_classes=10):
+        super(ResNet_Cifar, self).__init__()
+        self.in_planes = 16
+
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.layer1 = self._make_layer(block, 16, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2)
+        self.linear = nn.Linear(64, num_classes)
+
+        self.apply(_weights_init)
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = F.avg_pool2d(out, out.size()[3])
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
+
+
+@register_model
+def resnet20(num_classes=10, **kwargs):
+    return ResNet_Cifar(BasicBlock_Cifar, [3, 3, 3], num_classes=num_classes)
+
+
+@register_model
+def resnet32(num_classes=10, **kwargs):
+    return ResNet_Cifar(BasicBlock_Cifar, [5, 5, 5], num_classes=num_classes)
+
+
+@register_model
+def resnet44(num_classes=10, **kwargs):
+    return ResNet_Cifar(BasicBlock_Cifar, [7, 7, 7], num_classes=num_classes)
+
+
+@register_model
+def resnet56(num_classes=10, **kwargs):
+    return ResNet_Cifar(BasicBlock_Cifar, [9, 9, 9], num_classes=num_classes)
+
+
+@register_model
+def resnet110(num_classes=10, **kwargs):
+    return ResNet_Cifar(BasicBlock_Cifar, [18, 18, 18], num_classes=num_classes)
+
+
+@register_model
+def resnet1202(num_classes=10, **kwargs):
+    return ResNet_Cifar(BasicBlock_Cifar, [200, 200, 200], num_classes=num_classes)
 
 
 @register_model
@@ -546,6 +722,115 @@ def resnet50d(pretrained=False, num_classes=1000, in_chans=3, **kwargs):
 
 
 @register_model
+def seresnet50d(pretrained=False, num_classes=1000, in_chans=3, **kwargs):
+    """Constructs a ResNet-50-D model with se.
+    """
+    default_cfg = default_cfgs['resnet50d']
+    model = ResNet(
+        Bottleneck, [3, 4, 6, 3], stem_width=32, stem_type='deep', avg_down=True,
+        num_classes=num_classes, in_chans=in_chans, block_args=dict(attn_layer='se'), **kwargs)
+    model.default_cfg = default_cfg
+    if pretrained:
+        load_pretrained(model, default_cfg, num_classes, in_chans)
+    return model
+
+@register_model
+def seresnet50daa(pretrained=False, num_classes=1000, in_chans=3, **kwargs):
+    """Constructs a ResNet-50-D model with se and aa.
+    """
+    default_cfg = default_cfgs['resnet50d']
+    model = ResNet(
+        Bottleneck, [3, 4, 6, 3], stem_width=32, stem_type='deep', avg_down=True,
+        num_classes=num_classes, in_chans=in_chans, aa=True, block_args=dict(attn_layer='se'), **kwargs)
+    model.default_cfg = default_cfg
+    if pretrained:
+        load_pretrained(model, default_cfg, num_classes, in_chans)
+    return model
+
+@register_model
+def ecaresnet50d(pretrained=False, num_classes=1000, in_chans=3, **kwargs):
+    """Constructs a ResNet-50-D model with eca.
+    """
+    default_cfg = default_cfgs['resnet50d']
+    model = ResNet(
+        Bottleneck, [3, 4, 6, 3], stem_width=32, stem_type='deep', avg_down=True,
+        num_classes=num_classes, in_chans=in_chans, block_args=dict(attn_layer='eca'), **kwargs)
+    model.default_cfg = default_cfg
+    if pretrained:
+        load_pretrained(model, default_cfg, num_classes, in_chans)
+    return model
+
+
+
+@register_model
+def yresnet(pretrained=False, num_classes=1000, in_chans=3, **kwargs):
+    """Constructs a ResNet-50-D model with eca.
+    """
+    default_cfg = default_cfgs['resnet50d']
+    model = ResNet(
+        Bottleneck, [1, 1, 11, 3], stem_width=32, avg_down=True,
+        num_classes=num_classes, in_chans=in_chans, block_args=dict(attn_layer='eca'), **kwargs)
+    model.default_cfg = default_cfg
+    if pretrained:
+        load_pretrained(model, default_cfg, num_classes, in_chans)
+    return model
+
+
+@register_model
+def yresnetv2(pretrained=False, num_classes=1000, in_chans=3, **kwargs):
+    """Constructs a ResNet-50-D model with eca.
+    """
+    default_cfg = default_cfgs['resnet50d']
+    model = ResNet(
+        Bottleneck, [3, 4, 11, 3], stem_width=32, avg_down=True,
+        num_classes=num_classes, in_chans=in_chans, block_args=dict(attn_layer='eca'), use_basic=True, **kwargs)
+    model.default_cfg = default_cfg
+    if pretrained:
+        load_pretrained(model, default_cfg, num_classes, in_chans)
+    return model
+
+@register_model
+def yresnetl(pretrained=False, num_classes=1000, in_chans=3, **kwargs):
+    """Constructs a ResNet-50-D model with eca.
+    """
+    default_cfg = default_cfgs['resnet50d']
+    model = ResNet(
+        Bottleneck, [3, 4, 11, 3], stem_width=32, avg_down=True,
+        num_classes=num_classes, in_chans=in_chans, block_args=dict(attn_layer='eca'), **kwargs)
+    model.default_cfg = default_cfg
+    if pretrained:
+        load_pretrained(model, default_cfg, num_classes, in_chans)
+    return model
+
+@register_model
+def ecaresnet50daa(pretrained=False, num_classes=1000, in_chans=3, **kwargs):
+    """Constructs a ResNet-50-D model with eca.
+    """
+    default_cfg = default_cfgs['resnet50d']
+    model = ResNet(
+        Bottleneck, [3, 4, 6, 3], stem_width=32, stem_type='deep', avg_down=True,
+        num_classes=num_classes, in_chans=in_chans,  aa=True, block_args=dict(attn_layer='eca'), **kwargs)
+    model.default_cfg = default_cfg
+    if pretrained:
+        load_pretrained(model, default_cfg, num_classes, in_chans)
+    return model
+
+
+@register_model
+def dctseresnet50d(pretrained=False, num_classes=1000, in_chans=3, **kwargs):
+    """Constructs a ResNet-50-D model with dct input.
+    """
+    default_cfg = default_cfgs['dctseresnet50d']
+    model = ResNet(
+        Bottleneck, [3, 4, 6, 3], stem_width=32, stem_type='deep', use_DCT=True, avg_down=True,
+        num_classes=num_classes, in_chans=in_chans, block_args=dict(attn_layer='se'), **kwargs)
+    model.default_cfg = default_cfg
+    if pretrained:
+        load_pretrained(model, default_cfg, num_classes, in_chans)
+    return model
+
+
+@register_model
 def resnet101(pretrained=False, num_classes=1000, in_chans=3, **kwargs):
     """Constructs a ResNet-101 model.
     """
@@ -556,6 +841,19 @@ def resnet101(pretrained=False, num_classes=1000, in_chans=3, **kwargs):
         load_pretrained(model, default_cfg, num_classes, in_chans)
     return model
 
+
+@register_model
+def ecaresnet101d(pretrained=False, num_classes=1000, in_chans=3, **kwargs):
+    """Constructs a ResNet-50-D model with eca.
+    """
+    default_cfg = default_cfgs['resnet50d']
+    model = ResNet(
+        Bottleneck, [3, 4, 23, 3], stem_width=32, stem_type='deep', avg_down=True,
+        num_classes=num_classes, in_chans=in_chans, block_args=dict(attn_layer='eca'), **kwargs)
+    model.default_cfg = default_cfg
+    if pretrained:
+        load_pretrained(model, default_cfg, num_classes, in_chans)
+    return model
 
 @register_model
 def resnet152(pretrained=False, num_classes=1000, in_chans=3, **kwargs):
