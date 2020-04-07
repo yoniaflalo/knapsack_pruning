@@ -29,7 +29,7 @@ The code to prune the model can be found in the file `train_pruning.py`. We will
 Let start with a command that can reproduce pruning of 41% of the FLOPS of ResNet-50 and get 78.54% final accuracy.
 For this, we should start from the model in the
 [latest checkpoint of Ross Wightman](https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights/resnet50_ram-a26f946b.pth)
-that achieves 79% accuracy on the test set. For convenience, we have uploaded the checkpoint to the OSS.
+that achieves 79% accuracy on the test set. 
 **For now, our code supports only distributed data parallel training and not Pytorch data parallel.**
 
 
@@ -50,11 +50,6 @@ python -u -m torch.distributed.launch --nproc_per_node=8 \
 --prune_skip \
 --gamma_knowledge=20 \
 --epochs=50 \
---oss_access_key_id=************* \
---oss_access_key_secret=********* \
---oss_cache \
---oss_checkpoint_path=oss://imvl-automl-sh/darts/hyperml/hyperml/rwightman_weights/resnet50_ram-a26f946b.pth \
---oss_dataset_path=oss://imvl-ml-assets-sh/datasets/Imagenet/tar_file/
 ```
 
 Let's go over the parameters:
@@ -67,8 +62,7 @@ python -u -m torch.distributed.launch --nproc_per_node=8 \
 ./train_pruning.py \
 ```
 
-* The first parameter `/data/imagenet/` is the location of the dataset. When training on hyperML, this parameter
-is irrelevant, since it will be erased by the `oss_dataset_path`.
+* The first parameter `/data/imagenet/` is the location of the dataset. 
 
 * The second parameter `-b` represents the batch size.
 
@@ -101,24 +95,9 @@ in the paper
 `--taylor_var`. It uses the Taylor scheme of [Molchanov et.al](https://arxiv.org/abs/1611.06440). It is not recommended to use this option since this led to
 lower accuracy.   
 
-Now we distinguish two cases:
-#### Working locally
-In the case you work without OSS, you just need to indicate where the dataset and initial checkpoint are located. The 
-dataset path is the first parameter you provide. 
 * `--initial-checkpoint` represents the local path of the unpruned checkpoint.
 * `--output` is the path for output folder
 
-#### Working with OSS
-In this case, the following parameters are relevant:
-* `oss_access_key_id` and `oss_access_key_secret` are the id and password of the OSS endpoint you use
-* `oss_cache` indicates that you use the OSS cache to download the data
-* `oss_dataset_endpoint` represents the endpoint to use for the dataset, by default, it is `oss-cn-shanghai.aliyuncs.com`
-* `oss_checkpoint_endpoint`: same as above, for the checkpoint
-* `download_output_path` is the path of the folder where to download the dataset and checkpoint
-* `untar_output_path` is the path of the folder where you want to untar the dataset folder. For huge datasets like Imagenet
-we do not want to copy the files one by one because it would be very slow, so we copy a huge tar file and uncompress it 
-locally
-* `ckpt_output_path`: same as above for the checkpoint.
 
 ## Loading a pruned model
 Suppose that you have trained and pruned a model, and would like to fine-tune it or load it in another repository.
@@ -127,32 +106,32 @@ checkpoint. You need to provide the original model as first parameter of the fun
 checkpoint as second parameter. The function will analyse and compare the number of channels of the convolutions, 
 batch-norm layers and fully connected layers of the unpruned model and compare them with the one in the pruned checkpoint.
 You can also prune a pruned model by using the parameter `--initial-checkpoint-pruned` 
-(or `oss_checkpoint_pruned_path` when using OSS) in the `train_pruning.py` script.
+in the `train_pruning.py` script.
 
 ## Pretrained checkpoint 
 All of the pretrained checkpoint for efficientNet and ResNet are located in:
-[oss://imvl-automl-sh/darts/hyperml/hyperml/rwightman_weights](oss://imvl-automl-sh/darts/hyperml/hyperml/rwightman_weights/)
+`TODO add checkpoints`
+
 In particular, for ResNet-50 you have four checkpoints:
 * `resnet50-19c8e357.pth`, representing the official Pytorch pretrained model (accuracy: 76.15%)
 * `rw_resnet50-86acaeed.pth` representing the training of Ross Wightman  (accuracy: 78.47%)
 * `ya_resnet50-e18cda54.pth` representing my own training similar to Ross Wightman (accuracy: 78.45%)
 * `resnet50_ram-a26f946b.pth` representing the best ResNet model trained with JSD loss and AugMix augmentation scheme
- (accuracy: 79.0%). **We strongly recommand to use this checkpoint to get a pruned model**.
-The OSS repository also includes all the EfficientNet pretrained models.
+ (accuracy: 79.0%). **We strongly recommend to use this checkpoint to get a pruned model**.
 
 ## Benchmark
 To reproduce the results we got, we provide here some paths to hyperML runs, as well as final accuracy:
 
-Model to pruned | Pruning ratio | Unpruned accuracy |Pruned accuracy |HyperML Link
+Model to pruned | Pruning ratio | Unpruned accuracy |Pruned accuracy | Link
 ---|---|---|---|---|
-ResNet-50| 40.74% | 79.00% | 78.54% | [job 38458](https://hyperml.alibaba-inc.com/job/38458)
-ResNet-50| 50.80% | 79.00% | 77.74% | [job 38551](https://hyperml.alibaba-inc.com/job/38551)
-ResNet-50| 41.79% | 78.45% | 78.25% | [job 38555](https://hyperml.alibaba-inc.com/job/38555)
-ResNet-50| 50.80% | 78.45% | 77.90% | [job 38557](https://hyperml.alibaba-inc.com/job/38557)
-EfficientNet B0 | 46.00% | 77.30% | 75.50% | [job 34240](https://hyperml.alibaba-inc.com/job/34240)
-EfficientNet B1 | 44.28% | 79.20% | 78.30% | [job 33970](https://hyperml.alibaba-inc.com/job/33970)
-EfficientNet B2 | 30.00% | 80.30% | 79.90% | [job 33987](https://hyperml.alibaba-inc.com/job/33987)
-EfficientNet B3 | 44.00% | 81.7% | 80.80% | [job 32497](https://hyperml.alibaba-inc.com/job/32497)
+ResNet-50| 40.74% | 79.00% | 78.54% | [add link](https://hyperml.alibaba-inc.com/job/38458)
+ResNet-50| 50.80% | 79.00% | 77.74% | [add link](https://hyperml.alibaba-inc.com/job/38551)
+ResNet-50| 41.79% | 78.45% | 78.25% | [add link](https://hyperml.alibaba-inc.com/job/38555)
+ResNet-50| 50.80% | 78.45% | 77.90% | [add link](https://hyperml.alibaba-inc.com/job/38557)
+EfficientNet B0 | 46.00% | 77.30% | 75.50% | [add link](https://hyperml.alibaba-inc.com/job/34240)
+EfficientNet B1 | 44.28% | 79.20% | 78.30% | [add link](https://hyperml.alibaba-inc.com/job/33970)
+EfficientNet B2 | 30.00% | 80.30% | 79.90% | [add link](https://hyperml.alibaba-inc.com/job/33987)
+EfficientNet B3 | 44.00% | 81.7% | 80.80% | [add link](https://hyperml.alibaba-inc.com/job/32497)
 
 
 
