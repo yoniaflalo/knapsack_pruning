@@ -16,7 +16,6 @@ For now, our code supports the pruning of the following networks
 * [EfficientNet](https://arxiv.org/abs/1905.11946)
 
 We will see how to use this repository.
-Examples are given with hyperML, our internal training platform.
 
 ## Train the base model
 
