@@ -124,7 +124,7 @@ To reproduce the results we got, we provide here some paths to hyperML runs, as 
 Model to pruned | Pruning ratio | Unpruned accuracy |Pruned accuracy | Link
 ---|---|---|---|---|
 ResNet-50| 40.74% | 79.00% | 78.54% | [add link](https://hyperml.alibaba-inc.com/job/38458)
-ResNet-50| 50.80% | 79.00% | 77.74% | [add link](https://hyperml.alibaba-inc.com/job/38551)
+ResNet-50| 51.20% | 79.00% | 78.01% | [add link](https://hyperml.alibaba-inc.com/job/44758)
 ResNet-50| 41.79% | 78.45% | 78.25% | [add link](https://hyperml.alibaba-inc.com/job/38555)
 ResNet-50| 50.80% | 78.45% | 77.90% | [add link](https://hyperml.alibaba-inc.com/job/38557)
 EfficientNet B0 | 46.00% | 77.30% | 75.50% | [add link](https://hyperml.alibaba-inc.com/job/34240)
