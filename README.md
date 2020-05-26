@@ -96,6 +96,7 @@ lower accuracy.
 
 * `--initial-checkpoint` represents the local path of the unpruned checkpoint.
 * `--output` is the path for output folder
+* `--use_time` forces the algorithm to prune the network to optimize the inference time instead of the FLOPS, This option has provided very fast networks for GPU.
 
 
 ## Loading a pruned model
@@ -143,7 +144,7 @@ ECA Resnet-50D Pruned | 79.72% | 3600 | 1200 | 2.53| `ecaresnet50d_pruned`
 ECA Resnet-101D | 82.19% | 1476 | 444 | 8.07 | `ecaresnet101d`
 ECA Resnet-101D Pruned | 80.86% | 2800 | 1010 | 3.47 | `ecaresnet101d_pruned`
 
-In order to reproduce the pruning of eca-resnet-50D, we can use the following command:
+In order to reproduce the pruning based on inference time (and not flops) of eca-resnet-50D, we can use the following command:
 
 ```
 python -u -m torch.distributed.launch --nproc_per_node=8 \
@@ -154,16 +155,17 @@ python -u -m torch.distributed.launch --nproc_per_node=8 \
 -b=128 \
 --amp \
 --pretrained \
--j=16 \
+-j=8 \
 --model=ecaresnet50d \
---lr=0.02 \
+--lr=0.06 \
 --sched=cosine \
 -bp=100 \
---pruning_ratio=0.3 \
+--pruning_ratio=0.42 \
+--use_time \
 --prune \
 --prune_skip \
 --prune_conv1 \
---gamma_knowledge=20 \
---epochs=50 \
+--gamma_knowledge=30 \
+--epochs=200 \
 --smoothing=0 \
 ```
