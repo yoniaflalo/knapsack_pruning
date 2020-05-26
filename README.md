@@ -122,7 +122,7 @@ In particular, for ResNet-50 you have four checkpoints:
 The checkpoint of the models have been integrated in the repository, you can use the pretrained option to get them.
 
 For example, `--model=efficientnet_b1_pruned --pretrained` and the model will be loaded with its pretrained weight.
-For efficientNetb0, the pretrained weight can be found at this [link](oss://imvl-automl-sh/darts/hyperml/hyperml/job_45403/outputs/effnetb0_pruned_3986166a.pth)
+For efficientNetb0, the pretrained weight can be found at this [link](https://imvl-automl-sh.oss-cn-shanghai.aliyuncs.com/darts/hyperml/hyperml/job_45403/outputs/effnetb0_pruned_3986166a.pth).
 
 
 Model to prune | Pruning ratio | Unpruned accuracy |Pruned accuracy 
@@ -164,7 +164,6 @@ python -u -m torch.distributed.launch --nproc_per_node=8 \
 --prune_skip \
 --prune_conv1 \
 --gamma_knowledge=20 \
---oss_cache \
 --epochs=50 \
 --smoothing=0 \
 ```
