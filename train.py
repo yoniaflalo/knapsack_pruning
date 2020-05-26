@@ -37,15 +37,13 @@ from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy, JsdCro
 from timm.optim import create_optimizer
 from timm.scheduler import create_scheduler
 # in house managers
-from external.distributed_manager import DistributedManager
-from external.hyperml import HypermlDownloader
-from external.oss_and_hyperML_manager import untar_dataset_files
 from external.oss_and_pruning_parser import *
 from external.utils_pruning import load_module_from_ckpt, build_co_train_model, compute_flops
 import torch
 import torch.nn as nn
 import torchvision.utils
 import gc
+
 torch.backends.cudnn.benchmark = True
 
 # The first arg parser parses out only the --config argument, this argument is used to
@@ -202,11 +200,13 @@ parser.add_argument('--no-prefetcher', action='store_true', default=False,
                     help='disable fast prefetcher')
 parser.add_argument('--output', default='./outputs', type=str, metavar='PATH',
                     help='path to output folder (default: none, current dir)')
-parser.add_argument('--eval-metric', default='prec1', type=str, metavar='EVAL_METRIC',
-                    help='Best metric (default: "prec1"')
+parser.add_argument('--eval-metric', default='top1', type=str, metavar='EVAL_METRIC',
+                    help='Best metric (default: "top1"')
 parser.add_argument('--tta', type=int, default=0, metavar='N',
                     help='Test/inference time augmentation (oversampling) factor. 0=None (default: 0)')
 parser.add_argument("--local_rank", default=0, type=int)
+parser.add_argument('--use-multi-epochs-loader', action='store_true', default=False,
+                    help='use the multi-epochs-loader to save time at the beginning of every epoch')
 
 # HyperMl and OSS args:
 add_prune_to_parser(parser)
@@ -253,7 +253,6 @@ def main():
         args.world_size = torch.distributed.get_world_size()
         args.rank = torch.distributed.get_rank()
     assert args.rank >= 0
-    DistributedManager.set_args(args)
     if args.distributed:
         logging.info('Training in distributed mode with multiple processes, 1 GPU per process. Process %d, total %d.'
                      % (args.rank, args.world_size))
@@ -343,7 +342,6 @@ def main():
         if args.local_rank == 0:
             logging.info('Model IKD %s flops: %f GFlops' %
                          (args.model_IKD, flops / 1e9))
-
 
     num_aug_splits = 0
     if args.aug_splits > 0:
@@ -484,8 +482,8 @@ def main():
         num_workers=args.workers,
         distributed=args.distributed,
         collate_fn=collate_fn,
-        pin_memory=args.pin_mem
-    )
+        pin_memory=args.pin_mem,
+        use_multi_epochs_loader=args.use_multi_epochs_loader)
 
     eval_dir = os.path.join(args.data, 'val')
     if not os.path.isdir(eval_dir):
@@ -695,8 +693,8 @@ def train_epoch(
 def validate(model, loader, loss_fn, args, log_suffix=''):
     batch_time_m = AverageMeter()
     losses_m = AverageMeter()
-    prec1_m = AverageMeter()
-    prec5_m = AverageMeter()
+    top1_m = AverageMeter()
+    top5_m = AverageMeter()
 
     model.eval()
 
@@ -720,20 +718,20 @@ def validate(model, loader, loss_fn, args, log_suffix=''):
                 target = target[0:target.size(0):reduce_factor]
 
             loss = loss_fn(output, target)
-            prec1, prec5 = accuracy(output, target, topk=(1, 5))
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
             if args.distributed:
                 reduced_loss = reduce_tensor(loss.data, args.world_size)
-                prec1 = reduce_tensor(prec1, args.world_size)
-                prec5 = reduce_tensor(prec5, args.world_size)
+                acc1 = reduce_tensor(acc1, args.world_size)
+                acc5 = reduce_tensor(acc5, args.world_size)
             else:
                 reduced_loss = loss.data
 
             torch.cuda.synchronize()
 
             losses_m.update(reduced_loss.item(), input.size(0))
-            prec1_m.update(prec1.item(), output.size(0))
-            prec5_m.update(prec5.item(), output.size(0))
+            top1_m.update(acc1.item(), output.size(0))
+            top5_m.update(acc5.item(), output.size(0))
 
             batch_time_m.update(time.time() - end)
             end = time.time()
@@ -743,13 +741,12 @@ def validate(model, loader, loss_fn, args, log_suffix=''):
                     '{0}: [{1:>4d}/{2}]  '
                     'Time: {batch_time.val:.3f} ({batch_time.avg:.3f})  '
                     'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})  '
-                    'Prec@1: {top1.val:>7.4f} ({top1.avg:>7.4f})  '
-                    'Prec@5: {top5.val:>7.4f} ({top5.avg:>7.4f})'.format(
-                        log_name, batch_idx, last_idx,
-                        batch_time=batch_time_m, loss=losses_m,
-                        top1=prec1_m, top5=prec5_m))
+                    'Acc@1: {top1.val:>7.4f} ({top1.avg:>7.4f})  '
+                    'Acc@5: {top5.val:>7.4f} ({top5.avg:>7.4f})'.format(
+                        log_name, batch_idx, last_idx, batch_time=batch_time_m,
+                        loss=losses_m, top1=top1_m, top5=top5_m))
 
-    metrics = OrderedDict([('loss', losses_m.avg), ('prec1', prec1_m.avg), ('prec5', prec5_m.avg)])
+    metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)])
 
     return metrics
 

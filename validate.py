@@ -14,12 +14,18 @@ import glob
 import torch.nn.parallel
 from collections import OrderedDict
 
+try:
+    from apex import amp
+
+    has_apex = True
+except ImportError:
+    has_apex = False
+
 from timm.models import create_model, apply_test_time_pool, load_checkpoint, is_model, list_models
 from timm.data import Dataset, DatasetTar, create_loader, resolve_data_config
 from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging
-from external.hyperml import HypermlDownloader
-from external.oss_and_hyperML_manager import untar_dataset_files
 from external.utils_pruning import *
+from external.oss_and_pruning_parser import *
 
 torch.backends.cudnn.benchmark = True
 
@@ -60,8 +66,8 @@ parser.add_argument('--no-prefetcher', action='store_true', default=False,
                     help='disable fast prefetcher')
 parser.add_argument('--pin-mem', action='store_true', default=False,
                     help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
-parser.add_argument('--fp16', action='store_true', default=False,
-                    help='Use half precision (fp16)')
+parser.add_argument('--amp', action='store_true', default=False,
+                    help='Use AMP mixed precision')
 parser.add_argument('--tf-preprocessing', action='store_true', default=False,
                     help='Use Tensorflow preprocessing pipeline (require CPU TF installed')
 parser.add_argument('--use-ema', dest='use_ema', action='store_true',
@@ -70,14 +76,11 @@ parser.add_argument('--torchscript', dest='torchscript', action='store_true',
                     help='convert model torchscript for inference')
 parser.add_argument('--results-file', default='', type=str, metavar='FILENAME',
                     help='Output csv file for validation results (summary)')
-# HyperMl and OSS args:
-
-# pruning parameters
 
 
 def validate(args):
     # might as well try to validate something
-    args.pretrained = args.pretrained or (not args.checkpoint and not args.oss_checkpoint_path)
+    args.pretrained = args.pretrained or not args.checkpoint
     args.prefetcher = not args.no_prefetcher
     model = create_model(
         args.model,
@@ -85,6 +88,8 @@ def validate(args):
         in_chans=3,
         pretrained=args.pretrained)
     data_config = resolve_data_config(vars(args), model=model)
+    if args.fuse_bn:
+        model = fuse_bn(model)
     if args.checkpoint:
         try:
             load_checkpoint(model, args.checkpoint, args.use_ema)
@@ -107,18 +112,18 @@ def validate(args):
         torch.jit.optimized_execution(True)
         model = torch.jit.script(model)
 
-    if args.num_gpu > 1:
-        model = torch.nn.DataParallel(model, device_ids=list(range(args.num_gpu))).cuda()
+    if args.amp:
+        model = amp.initialize(model.cuda(), opt_level='O1')
     else:
         model = model.cuda()
 
-    if args.fp16:
-        model = model.half()
+    if args.num_gpu > 1:
+        model = torch.nn.DataParallel(model, device_ids=list(range(args.num_gpu)))
 
     criterion = nn.CrossEntropyLoss().cuda()
 
-    #from torchvision.datasets import ImageNet
-    #dataset = ImageNet(args.data, split='val')
+    # from torchvision.datasets import ImageNet
+    # dataset = ImageNet(args.data, split='val')
     if os.path.splitext(args.data)[1] == '.tar' and os.path.isfile(args.data):
         dataset = DatasetTar(args.data, load_bytes=args.tf_preprocessing, class_map=args.class_map)
     else:
@@ -136,9 +141,7 @@ def validate(args):
         num_workers=args.workers,
         crop_pct=crop_pct,
         pin_memory=args.pin_mem,
-        fp16=args.fp16,
         tf_preprocessing=args.tf_preprocessing)
-
 
     batch_time = AverageMeter()
     losses = AverageMeter()
@@ -147,7 +150,11 @@ def validate(args):
     model.eval()
     end = time.time()
     with torch.no_grad():
+        input_temp = torch.rand([args.batch_size, 3, 224, 224]).cuda()
+        output = model(input_temp)
         for i, (input, target) in enumerate(loader):
+            if i == 0:
+                end = time.time()
             if args.no_prefetcher:
                 target = target.cuda()
                 input = input.cuda()
@@ -159,10 +166,10 @@ def validate(args):
             loss = criterion(output, target)
 
             # measure accuracy and record loss
-            prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+            acc1, acc5 = accuracy(output.data, target, topk=(1, 5))
             losses.update(loss.item(), input.size(0))
-            top1.update(prec1.item(), input.size(0))
-            top5.update(prec5.item(), input.size(0))
+            top1.update(acc1.item(), input.size(0))
+            top5.update(acc5.item(), input.size(0))
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -173,8 +180,8 @@ def validate(args):
                     'Test: [{0:>4d}/{1}]  '
                     'Time: {batch_time.val:.3f}s ({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s)  '
                     'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})  '
-                    'Prec@1: {top1.val:>7.3f} ({top1.avg:>7.3f})  '
-                    'Prec@5: {top5.val:>7.3f} ({top5.avg:>7.3f})'.format(
+                    'Acc@1: {top1.val:>7.3f} ({top1.avg:>7.3f})  '
+                    'Acc@5: {top5.val:>7.3f} ({top5.avg:>7.3f})'.format(
                         i, len(loader), batch_time=batch_time,
                         rate_avg=input.size(0) / batch_time.avg,
                         loss=losses, top1=top1, top5=top5))
@@ -187,7 +194,7 @@ def validate(args):
         cropt_pct=crop_pct,
         interpolation=data_config['interpolation'])
 
-    logging.info(' * Prec@1 {:.3f} ({:.3f}) Prec@5 {:.3f} ({:.3f})'.format(
+    logging.info(' * Acc@1 {:.3f} ({:.3f}) Acc@5 {:.3f} ({:.3f})'.format(
         results['top1'], results['top1_err'], results['top5'], results['top5_err']))
 
     return results
