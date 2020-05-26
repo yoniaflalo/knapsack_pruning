@@ -119,18 +119,52 @@ In particular, for ResNet-50 you have four checkpoints:
  (accuracy: 79.0%). **We strongly recommend to use this checkpoint to get a pruned model**.
 
 ## Benchmark
-To reproduce the results we got, we provide here some paths to hyperML runs, as well as final accuracy:
+The checkpoint of the models have been integrated in the repository, you can use the pretrained option to get them.
 
-Model to pruned | Pruning ratio | Unpruned accuracy |Pruned accuracy | Link
----|---|---|---|---|
-ResNet-50| 40.74% | 79.00% | 78.54% | [add link](https://hyperml.alibaba-inc.com/job/38458)
-ResNet-50| 51.20% | 79.00% | 78.01% | [add link](https://hyperml.alibaba-inc.com/job/44758)
-ResNet-50| 41.79% | 78.45% | 78.25% | [add link](https://hyperml.alibaba-inc.com/job/38555)
-ResNet-50| 50.80% | 78.45% | 77.90% | [add link](https://hyperml.alibaba-inc.com/job/38557)
-EfficientNet B0 | 46.00% | 77.30% | 75.50% | [add link](https://hyperml.alibaba-inc.com/job/34240)
-EfficientNet B1 | 44.28% | 79.20% | 78.30% | [add link](https://hyperml.alibaba-inc.com/job/33970)
-EfficientNet B2 | 30.00% | 80.30% | 79.90% | [add link](https://hyperml.alibaba-inc.com/job/33987)
-EfficientNet B3 | 44.00% | 81.7% | 80.80% | [add link](https://hyperml.alibaba-inc.com/job/32497)
+For example, `--model=efficientnet_b1_pruned --pretrained` and the model will be loaded with its pretrained weight.
+For efficientNetb0, the pretrained weight can be found at this [link](oss://imvl-automl-sh/darts/hyperml/hyperml/job_45403/outputs/effnetb0_pruned_3986166a.pth)
 
 
+Model to prune | Pruning ratio | Unpruned accuracy |Pruned accuracy 
+---|---|---|---|
+EfficientNet B0 | 46.00% | 77.30% | 75.50% 
+EfficientNet B1 | 44.28% | 79.20% | 78.30% 
+EfficientNet B2 | 30.00% | 80.30% | 79.90% 
+EfficientNet B3 | 44.00% | 81.7% | 80.80% 
 
+In addition, we have added pruning from eca-ResNet-D models that we have integrated in the original ross wightman repository.
+
+
+Model | accuracy@top1 | inference speed on V100 (img/sec)| Inference speed on P100 (img/sec)| FLOPS (Gigas) | Model name
+---|---|---|---|---|---|
+ECA Resnet Light | 80.47% | 2915 | 862 | 4.11 | `ecaresnetlight`
+ECA Resnet-50D | 80.61% | 2400 | 718 | 4.35 | `ecaresnet50d` 
+ECA Resnet-50D Pruned | 79.72% | 3600 | 1200 | 2.53| `ecaresnet50d_pruned`
+ECA Resnet-101D | 82.19% | 1476 | 444 | 8.07 | `ecaresnet101d`
+ECA Resnet-101D Pruned | 80.86% | 2800 | 1010 | 3.47 | `ecaresnet101d_pruned`
+
+In order to reproduce the pruning of eca-resnet-50D, we can use the following command:
+
+```
+python -u -m torch.distributed.launch --nproc_per_node=8 \
+--nnodes=1 \
+--node_rank=0 \
+./train_pruning.py \
+/data/imagenet/ \
+-b=128 \
+--amp \
+--pretrained \
+-j=16 \
+--model=ecaresnet50d \
+--lr=0.02 \
+--sched=cosine \
+-bp=100 \
+--pruning_ratio=0.3 \
+--prune \
+--prune_skip \
+--prune_conv1 \
+--gamma_knowledge=20 \
+--oss_cache \
+--epochs=50 \
+--smoothing=0 \
+```
